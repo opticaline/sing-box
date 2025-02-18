@@ -40,16 +40,18 @@ func init() {
 var _ adapter.ClashServer = (*Server)(nil)
 
 type Server struct {
-	ctx             context.Context
-	router          adapter.Router
-	outboundManager adapter.OutboundManager
-	logger          log.Logger
-	httpServer      *http.Server
-	trafficManager  *trafficontrol.Manager
-	urlTestHistory  *urltest.HistoryStorage
-	mode            string
-	modeList        []string
-	modeUpdateHook  chan<- struct{}
+	ctx            context.Context
+	router         adapter.Router
+	dnsRouter      adapter.DNSRouter
+	outbound       adapter.OutboundManager
+	endpoint       adapter.EndpointManager
+	logger         log.Logger
+	httpServer     *http.Server
+	trafficManager *trafficontrol.Manager
+	urlTestHistory adapter.URLTestHistoryStorage
+	mode           string
+	modeList       []string
+	modeUpdateHook chan<- struct{}
 
 	externalController       bool
 	externalUI               string
@@ -61,10 +63,12 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 	trafficManager := trafficontrol.NewManager()
 	chiRouter := chi.NewRouter()
 	s := &Server{
-		ctx:             ctx,
-		router:          service.FromContext[adapter.Router](ctx),
-		outboundManager: service.FromContext[adapter.OutboundManager](ctx),
-		logger:          logFactory.NewLogger("clash-api"),
+		ctx:       ctx,
+		router:    service.FromContext[adapter.Router](ctx),
+		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
+		outbound:  service.FromContext[adapter.OutboundManager](ctx),
+		endpoint:  service.FromContext[adapter.EndpointManager](ctx),
+		logger:    logFactory.NewLogger("clash-api"),
 		httpServer: &http.Server{
 			Addr:    options.ExternalController,
 			Handler: chiRouter,
@@ -75,7 +79,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		externalUIDownloadURL:    options.ExternalUIDownloadURL,
 		externalUIDownloadDetour: options.ExternalUIDownloadDetour,
 	}
-	s.urlTestHistory = service.PtrFromContext[urltest.HistoryStorage](ctx)
+	s.urlTestHistory = service.FromContext[adapter.URLTestHistoryStorage](ctx)
 	if s.urlTestHistory == nil {
 		s.urlTestHistory = urltest.NewHistoryStorage()
 	}
@@ -119,18 +123,15 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/script", scriptRouter())
 		r.Mount("/profile", profileRouter())
 		r.Mount("/cache", cacheRouter(ctx))
-		r.Mount("/dns", dnsRouter(s.router))
+		r.Mount("/dns", dnsRouter(s.dnsRouter))
 
 		s.setupMetaAPI(r)
 	})
 	if options.ExternalUI != "" {
 		s.externalUI = filemanager.BasePath(ctx, os.ExpandEnv(options.ExternalUI))
 		chiRouter.Group(func(r chi.Router) {
-			fs := http.StripPrefix("/ui", http.FileServer(http.Dir(s.externalUI)))
-			r.Get("/ui", http.RedirectHandler("/ui/", http.StatusTemporaryRedirect).ServeHTTP)
-			r.Get("/ui/*", func(w http.ResponseWriter, r *http.Request) {
-				fs.ServeHTTP(w, r)
-			})
+			r.Get("/ui", http.RedirectHandler("/ui/", http.StatusMovedPermanently).ServeHTTP)
+			r.Handle("/ui/*", http.StripPrefix("/ui/", http.FileServer(http.Dir(s.externalUI))))
 		})
 	}
 	return s, nil
@@ -222,7 +223,7 @@ func (s *Server) SetMode(newMode string) {
 		default:
 		}
 	}
-	s.router.ClearDNSCache()
+	s.dnsRouter.ClearCache()
 	cacheFile := service.FromContext[adapter.CacheFile](s.ctx)
 	if cacheFile != nil {
 		err := cacheFile.StoreMode(newMode)
@@ -233,7 +234,7 @@ func (s *Server) SetMode(newMode string) {
 	s.logger.Info("updated mode: ", newMode)
 }
 
-func (s *Server) HistoryStorage() *urltest.HistoryStorage {
+func (s *Server) HistoryStorage() adapter.URLTestHistoryStorage {
 	return s.urlTestHistory
 }
 
@@ -242,11 +243,11 @@ func (s *Server) TrafficManager() *trafficontrol.Manager {
 }
 
 func (s *Server) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
-	return trafficontrol.NewTCPTracker(conn, s.trafficManager, metadata, s.outboundManager, matchedRule, matchOutbound)
+	return trafficontrol.NewTCPTracker(conn, s.trafficManager, metadata, s.outbound, matchedRule, matchOutbound)
 }
 
 func (s *Server) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
-	return trafficontrol.NewUDPTracker(conn, s.trafficManager, metadata, s.outboundManager, matchedRule, matchOutbound)
+	return trafficontrol.NewUDPTracker(conn, s.trafficManager, metadata, s.outbound, matchedRule, matchOutbound)
 }
 
 func authentication(serverSecret string) func(next http.Handler) http.Handler {
@@ -321,18 +322,15 @@ func traffic(trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, 
 		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
 		buf := &bytes.Buffer{}
-		var (
-			uploadTotal   int64
-			doanloadTotal int64
-			err           error
-		)
+		uploadTotal, downloadTotal := trafficManager.Total()
 		for range tick.C {
 			buf.Reset()
 			uploadTotalNew, downloadTotalNew := trafficManager.Total()
-			if err := json.NewEncoder(buf).Encode(Traffic{
+			err := json.NewEncoder(buf).Encode(Traffic{
 				Up:   uploadTotalNew - uploadTotal,
-				Down: downloadTotalNew - doanloadTotal,
-			}); err != nil {
+				Down: downloadTotalNew - downloadTotal,
+			})
+			if err != nil {
 				break
 			}
 			if conn == nil {
@@ -344,8 +342,9 @@ func traffic(trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, 
 			if err != nil {
 				break
 			}
+
 			uploadTotal = uploadTotalNew
-			doanloadTotal = downloadTotalNew
+			downloadTotal = downloadTotalNew
 		}
 	}
 }

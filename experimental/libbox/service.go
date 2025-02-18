@@ -35,7 +35,7 @@ import (
 type BoxService struct {
 	ctx                   context.Context
 	cancel                context.CancelFunc
-	urlTestHistoryStorage *urltest.HistoryStorage
+	urlTestHistoryStorage adapter.URLTestHistoryStorage
 	instance              *box.Box
 	clashServer           adapter.ClashServer
 	pauseManager          pause.Manager
@@ -44,7 +44,7 @@ type BoxService struct {
 }
 
 func NewService(configContent string, platformInterface PlatformInterface) (*BoxService, error) {
-	ctx := box.Context(context.Background(), include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry())
+	ctx := BaseContext(platformInterface)
 	ctx = filemanager.WithDefault(ctx, sWorkingPath, sTempPath, sUserID, sGroupID)
 	service.MustRegister[deprecated.Manager](ctx, new(deprecatedManager))
 	options, err := parseConfig(ctx, configContent)
@@ -81,23 +81,36 @@ func NewService(configContent string, platformInterface PlatformInterface) (*Box
 }
 
 func (s *BoxService) Start() error {
-	return s.instance.Start()
+	if sFixAndroidStack {
+		var err error
+		done := make(chan struct{})
+		go func() {
+			err = s.instance.Start()
+			close(done)
+		}()
+		<-done
+		return err
+	} else {
+		return s.instance.Start()
+	}
 }
 
 func (s *BoxService) Close() error {
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-done:
-			return
-		case <-time.After(C.FatalStopTimeout):
-			os.Exit(1)
-		}
-	}()
 	s.cancel()
 	s.urlTestHistoryStorage.Close()
-	return s.instance.Close()
+	var err error
+	done := make(chan struct{})
+	go func() {
+		err = s.instance.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return err
+	case <-time.After(C.FatalStopTimeout):
+		os.Exit(1)
+		return nil
+	}
 }
 
 func (s *BoxService) NeedWIFIState() bool {
@@ -135,10 +148,10 @@ func (w *platformInterfaceWrapper) AutoDetectInterfaceControl(fd int) error {
 
 func (w *platformInterfaceWrapper) OpenTun(options *tun.Options, platformOptions option.TunPlatformOptions) (tun.Tun, error) {
 	if len(options.IncludeUID) > 0 || len(options.ExcludeUID) > 0 {
-		return nil, E.New("android: unsupported uid options")
+		return nil, E.New("platform: unsupported uid options")
 	}
 	if len(options.IncludeAndroidUser) > 0 {
-		return nil, E.New("android: unsupported android_user option")
+		return nil, E.New("platform: unsupported android_user option")
 	}
 	routeRanges, err := options.BuildAutoRouteRanges(true)
 	if err != nil {
@@ -179,6 +192,9 @@ func (w *platformInterfaceWrapper) Interfaces() ([]adapter.NetworkInterface, err
 			continue
 		}
 		w.defaultInterfaceAccess.Lock()
+		// (GOOS=windows) SA4006: this value of `isDefault` is never used
+		// Why not used?
+		//nolint:staticcheck
 		isDefault := w.defaultInterface != nil && int(netInterface.Index) == w.defaultInterface.Index
 		w.defaultInterfaceAccess.Unlock()
 		interfaces = append(interfaces, adapter.NetworkInterface{
@@ -216,6 +232,10 @@ func (w *platformInterfaceWrapper) ReadWIFIState() adapter.WIFIState {
 		return adapter.WIFIState{}
 	}
 	return (adapter.WIFIState)(*wifiState)
+}
+
+func (w *platformInterfaceWrapper) SystemCertificates() []string {
+	return iteratorToArray[string](w.iif.SystemCertificates())
 }
 
 func (w *platformInterfaceWrapper) FindProcessInfo(ctx context.Context, network string, source netip.AddrPort, destination netip.AddrPort) (*process.Info, error) {

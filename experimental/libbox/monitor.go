@@ -55,6 +55,14 @@ func (m *platformDefaultInterfaceMonitor) UnregisterCallback(element *list.Eleme
 }
 
 func (m *platformDefaultInterfaceMonitor) UpdateDefaultInterface(interfaceName string, interfaceIndex32 int32, isExpensive bool, isConstrained bool) {
+	if sFixAndroidStack {
+		go m.updateDefaultInterface(interfaceName, interfaceIndex32, isExpensive, isConstrained)
+	} else {
+		m.updateDefaultInterface(interfaceName, interfaceIndex32, isExpensive, isConstrained)
+	}
+}
+
+func (m *platformDefaultInterfaceMonitor) updateDefaultInterface(interfaceName string, interfaceIndex32 int32, isExpensive bool, isConstrained bool) {
 	m.isExpensive = isExpensive
 	m.isConstrained = isConstrained
 	err := m.networkManager.UpdateInterfaces()

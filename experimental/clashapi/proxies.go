@@ -46,7 +46,7 @@ func findProxyByName(server *Server) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			name := r.Context().Value(CtxKeyProxyName).(string)
-			proxy, exist := server.outboundManager.Outbound(name)
+			proxy, exist := server.outbound.Outbound(name)
 			if !exist {
 				render.Status(r, http.StatusNotFound)
 				render.JSON(w, r, ErrNotFound)
@@ -72,9 +72,9 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	info.Put("udp", common.Contains(detour.Network(), N.NetworkUDP))
 	delayHistory := server.urlTestHistory.LoadURLTestHistory(adapter.OutboundTag(detour))
 	if delayHistory != nil {
-		info.Put("history", []*urltest.History{delayHistory})
+		info.Put("history", []*adapter.URLTestHistory{delayHistory})
 	} else {
-		info.Put("history", []*urltest.History{})
+		info.Put("history", []*adapter.URLTestHistory{})
 	}
 	if group, isGroup := detour.(adapter.OutboundGroup); isGroup {
 		info.Put("now", group.Now())
@@ -86,9 +86,14 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 func getProxies(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var proxyMap badjson.JSONObject
-		outbounds := common.Filter(server.outboundManager.Outbounds(), func(detour adapter.Outbound) bool {
+		outbounds := common.Filter(server.outbound.Outbounds(), func(detour adapter.Outbound) bool {
 			return detour.Tag() != ""
 		})
+		outbounds = append(outbounds, common.Map(common.Filter(server.endpoint.Endpoints(), func(detour adapter.Endpoint) bool {
+			return detour.Tag() != ""
+		}), func(it adapter.Endpoint) adapter.Outbound {
+			return it
+		})...)
 
 		allProxies := make([]string, 0, len(outbounds))
 
@@ -100,7 +105,7 @@ func getProxies(server *Server) func(w http.ResponseWriter, r *http.Request) {
 			allProxies = append(allProxies, detour.Tag())
 		}
 
-		defaultTag := server.outboundManager.Default().Tag()
+		defaultTag := server.outbound.Default().Tag()
 
 		sort.SliceStable(allProxies, func(i, j int) bool {
 			return allProxies[i] == defaultTag
@@ -111,7 +116,7 @@ func getProxies(server *Server) func(w http.ResponseWriter, r *http.Request) {
 			"type":    "Fallback",
 			"name":    "GLOBAL",
 			"udp":     true,
-			"history": []*urltest.History{},
+			"history": []*adapter.URLTestHistory{},
 			"all":     allProxies,
 			"now":     defaultTag,
 		})
@@ -203,7 +208,7 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			if err != nil {
 				server.urlTestHistory.DeleteURLTestHistory(realTag)
 			} else {
-				server.urlTestHistory.StoreURLTestHistory(realTag, &urltest.History{
+				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: delay,
 				})
