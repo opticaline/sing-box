@@ -10,7 +10,7 @@ on:
         description: "The tag version you want to build"
 
 env:
-  REGISTRY_IMAGE: ghcr.io/opticalin
+  REGISTRY_IMAGE: ghcr.io/opticaline/sing-box
 
 jobs:
   build:
